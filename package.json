@@ -1,0 +1,20 @@
+{
+  "name": "evolve-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Backend for Eve voice generation",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "openai": "^6.31.0"
+  }
+}
