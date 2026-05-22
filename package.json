@@ -1,15 +1,21 @@
 {
-  "name": "evolve-backend",
+  "name": "evolve",
   "version": "1.0.0",
   "type": "module",
-  "description": "Backend for Eve voice generation",
-  "main": "server.js",
+  "description": "A new Flutter project.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "engines": {
     "node": ">=20 <23"
   },
-  "scripts": {
-    "start": "node server.js"
-  },
+  "keywords": [],
+  "author": "",
   "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
