@@ -8,11 +8,15 @@ dotenv.config();
 const app = express();
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const aiPlanUsage = new Map();
+const tomtomUsage = new Map();
 const AI_PLAN_WINDOW_MS = 24 * 60 * 60 * 1000;
 const AI_PLAN_DAILY_LIMIT = Number(process.env.AI_PLAN_DAILY_LIMIT || 20);
 const AI_PLAN_MAX_OUTPUT_TOKENS = Number(
   process.env.AI_PLAN_MAX_OUTPUT_TOKENS || 700,
 );
+const TOMTOM_API_KEY = String(process.env.TOMTOM_API_KEY || "").trim();
+const TOMTOM_WINDOW_MS = 24 * 60 * 60 * 1000;
+const TOMTOM_DAILY_LIMIT = Number(process.env.TOMTOM_DAILY_LIMIT || 250);
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -42,6 +46,53 @@ function consumeDailyLimit(key, limit) {
   current.count += 1;
   aiPlanUsage.set(key, current);
   return true;
+}
+
+function consumeTomTomLimit(key, limit) {
+  const now = Date.now();
+  const current = tomtomUsage.get(key);
+  if (!current || now - current.windowStartedAt >= TOMTOM_WINDOW_MS) {
+    tomtomUsage.set(key, { count: 1, windowStartedAt: now });
+    return true;
+  }
+  if (current.count >= limit) {
+    return false;
+  }
+  current.count += 1;
+  tomtomUsage.set(key, current);
+  return true;
+}
+
+function tomtomRequesterKey(req) {
+  return `tomtom:${clientKeyFromRequest(req)}`;
+}
+
+async function fetchTomTomJson(pathname, params) {
+  if (!TOMTOM_API_KEY) {
+    throw new Error("Missing TOMTOM_API_KEY");
+  }
+
+  const url = new URL(`https://api.tomtom.com${pathname}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  url.searchParams.set("key", TOMTOM_API_KEY);
+
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "PulseTrip-Backend/1.0",
+    },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`TomTom request failed (${response.status}): ${body}`);
+  }
+
+  return response.json();
 }
 
 app.post("/ai/plan", async (req, res) => {
@@ -91,6 +142,123 @@ app.post("/ai/plan", async (req, res) => {
     return res.status(500).json({
       error: "AI planning failed",
     });
+  }
+});
+
+app.post("/places/reverse", async (req, res) => {
+  try {
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return res.status(400).json({ error: "Missing coordinates" });
+    }
+
+    const allowed = consumeTomTomLimit(tomtomRequesterKey(req), TOMTOM_DAILY_LIMIT);
+    if (!allowed) {
+      return res.status(429).json({ error: "Daily TomTom limit reached" });
+    }
+
+    const decoded = await fetchTomTomJson(
+      `/search/2/reverseGeocode/${latitude.toFixed(6)},${longitude.toFixed(6)}.json`,
+      {
+        radius: 2000,
+        language: "en-GB",
+      },
+    );
+
+    const results = Array.isArray(decoded.addresses) ? decoded.addresses : [];
+    if (results.length === 0) {
+      return res.json({ city: null });
+    }
+
+    const address = results[0]?.address ?? {};
+    const countryCode = String(address.countryCodeISO3 || "").trim().toUpperCase();
+    let city = "";
+    if (countryCode === "CYM") {
+      city = "Grand Cayman";
+    } else {
+      city =
+        String(address.municipality || "").trim() ||
+        String(address.municipalitySubdivision || "").trim() ||
+        String(address.countrySecondarySubdivision || "").trim() ||
+        String(address.countrySubdivision || "").trim();
+    }
+
+    return res.json({ city: city || null, raw: results[0] ?? null });
+  } catch (error) {
+    console.error("TomTom reverse error:", error);
+    return res.status(500).json({ error: "TomTom reverse geocoding failed" });
+  }
+});
+
+app.post("/places/geocode", async (req, res) => {
+  try {
+    const city = String(req.body?.city ?? "").trim();
+    if (!city) {
+      return res.status(400).json({ error: "Missing city" });
+    }
+
+    const allowed = consumeTomTomLimit(tomtomRequesterKey(req), TOMTOM_DAILY_LIMIT);
+    if (!allowed) {
+      return res.status(429).json({ error: "Daily TomTom limit reached" });
+    }
+
+    const decoded = await fetchTomTomJson(`/search/2/geocode/${city}.json`, {
+      limit: 1,
+      language: "en-GB",
+    });
+
+    const results = Array.isArray(decoded.results) ? decoded.results : [];
+    const position = results[0]?.position ?? null;
+    if (!position) {
+      return res.json({ lat: null, lon: null });
+    }
+
+    return res.json({
+      lat: position.lat ?? null,
+      lon: position.lon ?? null,
+      raw: results[0] ?? null,
+    });
+  } catch (error) {
+    console.error("TomTom geocode error:", error);
+    return res.status(500).json({ error: "TomTom geocoding failed" });
+  }
+});
+
+app.post("/places/nearby", async (req, res) => {
+  try {
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    const radiusKm = Number(req.body?.radiusKm ?? 40.2336);
+    const limit = Number(req.body?.limit ?? 20);
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return res.status(400).json({ error: "Missing coordinates" });
+    }
+
+    const allowed = consumeTomTomLimit(tomtomRequesterKey(req), TOMTOM_DAILY_LIMIT);
+    if (!allowed) {
+      return res.status(429).json({ error: "Daily TomTom limit reached" });
+    }
+
+    const decoded = await fetchTomTomJson("/search/2/nearbySearch/.json", {
+      lat: latitude.toFixed(6),
+      lon: longitude.toFixed(6),
+      radius: Math.round(radiusKm * 1000),
+      limit: Math.max(1, Math.min(limit, 30)),
+      idxSet: "POI",
+      language: "en-GB",
+      openingHours: "nextSevenDays",
+      relatedPois: "off",
+      timeZone: "iana",
+    });
+
+    return res.json({
+      results: Array.isArray(decoded.results) ? decoded.results : [],
+    });
+  } catch (error) {
+    console.error("TomTom nearby error:", error);
+    return res.status(500).json({ error: "TomTom nearby search failed" });
   }
 });
 
