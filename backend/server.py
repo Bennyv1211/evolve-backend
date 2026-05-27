@@ -1474,7 +1474,8 @@ async def create_session(body: ChatSessionCreate, user: dict = Depends(get_curre
 
 @api_router.get("/chat/sessions")
 async def list_sessions(user: dict = Depends(get_current_user)):
-    docs = await fs_query("chat_sessions", filters=[("user_id", "==", user["id"])], order_by="updated_at", descending=True, limit=100)
+    docs = await fs_query("chat_sessions", filters=[("user_id", "==", user["id"])], limit=100)
+    docs.sort(key=lambda doc: doc.get("updated_at") or "", reverse=True)
     return docs
 
 
