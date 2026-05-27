@@ -34,7 +34,7 @@ FREE_PROMPT_LIMIT = int(os.environ.get("FREE_PROMPT_LIMIT", "3"))
 OPENAI_TEXT_MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "nano-banana-2")
+KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "gpt image 2, image-to-image, 1k")
 KIE_MAX_IMAGES_PER_REQUEST = int(os.environ.get("KIE_MAX_IMAGES_PER_REQUEST", "1"))
 KIE_API_KEY = os.environ.get("KIE_API_KEY", "")
 KIE_API_BASE_URL = os.environ.get("KIE_API_BASE_URL", "https://api.kie.ai").rstrip("/")
@@ -985,7 +985,7 @@ class OnboardingBody(BaseModel):
 
 
 class SocialConnectBody(BaseModel):
-    platform: Literal["instagram", "facebook", "tiktok"]
+    platform: Literal["instagram", "facebook"]
     handle: str
 
 
@@ -1022,7 +1022,7 @@ class CaptionBody(BaseModel):
 class PublishBody(BaseModel):
     image_id: str
     caption: str
-    platform: Literal["instagram", "facebook", "tiktok"] = "instagram"
+    platform: Literal["instagram", "facebook"] = "instagram"
     session_id: Optional[str] = None
 
 
