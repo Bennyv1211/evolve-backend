@@ -59,6 +59,28 @@ MAX_AI_PER_MINUTE_PER_USER = int(os.environ.get("MAX_AI_PER_MINUTE_PER_USER", "3
 GLOBAL_DAILY_AI_CAP = int(os.environ.get("GLOBAL_DAILY_AI_CAP", "500"))            # all users combined
 REGISTRATIONS_PER_HOUR_PER_IP = int(os.environ.get("REGISTRATIONS_PER_HOUR_PER_IP", "5"))
 
+
+def _resolve_kie_image_model(has_source_image: bool) -> str:
+    raw = (KIE_IMAGE_MODEL or "").strip()
+    normalized = raw.lower()
+
+    gpt_image_aliases = {
+        "gpt-image-2",
+        "gpt image 2",
+        "gpt image 2 1k",
+        "gpt-image-2-1k",
+        "gpt image 2, 1k",
+    }
+    if normalized in gpt_image_aliases:
+        return "gpt image 2, image-to-image, 1k" if has_source_image else "gpt image 2, text-to-image, 1k"
+
+    if "gpt image 2" in normalized:
+        if has_source_image:
+            return "gpt image 2, image-to-image, 1k"
+        return "gpt image 2, text-to-image, 1k"
+
+    return raw
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("evolve")
@@ -609,8 +631,9 @@ async def _upload_kie_base64_image(image_b64: str, mime_type: str) -> str:
 async def _create_kie_image_task(prompt: str, image_b64: str, mime_type: str) -> str:
     require_config(KIE_API_KEY, "KIE_API_KEY")
     source_image_url = await _upload_kie_base64_image(image_b64, mime_type)
+    resolved_model = _resolve_kie_image_model(has_source_image=True)
     payload = {
-        "model": KIE_IMAGE_MODEL,
+        "model": resolved_model,
         "input": {
             "prompt": prompt,
             "image_input": [source_image_url],
@@ -629,7 +652,10 @@ async def _create_kie_image_task(prompt: str, image_b64: str, mime_type: str) ->
     if not task_id:
         provider_error = _extract_kie_error(data)
         if provider_error:
-            raise HTTPException(status_code=502, detail=f"Image provider error: {provider_error}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Image provider error: {provider_error} (model sent: {resolved_model})",
+            )
         raise HTTPException(status_code=502, detail="Image provider did not return a task ID.")
     return task_id
 
@@ -1536,7 +1562,7 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             log_ai_event(
                 user_id=user["id"],
                 provider="kie",
-                model=KIE_IMAGE_MODEL,
+                model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
                 prompt_length=len(prompt),
                 image_count=1 if image_b64 else 0,
                 success=False,
@@ -1551,7 +1577,7 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             log_ai_event(
                 user_id=user["id"],
                 provider="kie",
-                model=KIE_IMAGE_MODEL,
+                model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
                 prompt_length=len(prompt),
                 image_count=1 if image_b64 else 0,
                 success=False,
@@ -1578,7 +1604,7 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
         log_ai_event(
             user_id=user["id"],
             provider="kie",
-            model=KIE_IMAGE_MODEL,
+            model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
             prompt_length=len(prompt),
             image_count=1 if image_b64 else 0,
             success=True,
