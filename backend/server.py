@@ -16,7 +16,7 @@ import requests
 import firebase_admin
 from PIL import Image
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, Form, Request
-from fastapi.responses import Response, RedirectResponse
+from fastapi.responses import Response, RedirectResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from firebase_admin import auth as firebase_auth_admin, credentials, firestore
@@ -34,7 +34,7 @@ FREE_PROMPT_LIMIT = int(os.environ.get("FREE_PROMPT_LIMIT", "3"))
 OPENAI_TEXT_MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "gemini-3.1-flash-image-preview")
+KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "nano-banana-2")
 KIE_MAX_IMAGES_PER_REQUEST = int(os.environ.get("KIE_MAX_IMAGES_PER_REQUEST", "1"))
 KIE_API_KEY = os.environ.get("KIE_API_KEY", "")
 KIE_API_BASE_URL = os.environ.get("KIE_API_BASE_URL", "https://api.kie.ai").rstrip("/")
@@ -1043,6 +1043,15 @@ class ChatMessage(BaseModel):
 @api_router.get("/")
 async def root():
     return {"ok": True, "service": "Evolve Content Creator API"}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled server error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+    )
 
 
 # ---------- Auth ----------
