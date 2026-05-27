@@ -1645,20 +1645,37 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             )
             raise HTTPException(status_code=502, detail="Empty image from AI")
 
-        new_rec = await save_image_record(user["id"], new_b64, new_mime, "kie",
-                                          meta={"prompt": prompt, "session_id": session_id})
+        try:
+            new_rec = await save_image_record(
+                user["id"],
+                new_b64,
+                new_mime,
+                "kie",
+                meta={"prompt": prompt, "session_id": session_id},
+            )
 
-        asst_msg = await push_message(
-            session_id, user["id"], "assistant", "image",
-            content="Here's your refined image. Want to tweak it further or generate a caption?",
-            image_id=new_rec["id"],
-            suggestions=["Generate a caption for this", "Make it even more dramatic", "Try a different style"],
-            meta={"prompt": prompt},
-        )
-        await fs_set("chat_sessions", session_id, {"cover_image_id": new_rec["id"]}, merge=True)
-        session_doc = await fs_get("chat_sessions", session_id)
-        if session_doc:
-            await sync_chat_session_doc(session_doc)
+            asst_msg = await push_message(
+                session_id, user["id"], "assistant", "image",
+                content="Here's your refined image. Want to tweak it further or generate a caption?",
+                image_id=new_rec["id"],
+                suggestions=["Generate a caption for this", "Make it even more dramatic", "Try a different style"],
+                meta={"prompt": prompt},
+            )
+            await fs_set("chat_sessions", session_id, {"cover_image_id": new_rec["id"]}, merge=True)
+            session_doc = await fs_get("chat_sessions", session_id)
+            if session_doc:
+                await sync_chat_session_doc(session_doc)
+        except HTTPException:
+            await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"])
+            await _decrement_global()
+            raise
+        except Exception as exc:
+            await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"])
+            await _decrement_global()
+            logger.exception("Failed to persist generated image/chat payload")
+            raise HTTPException(status_code=502, detail=f"Generated image succeeded but could not be saved in app: {str(exc)[:220]}")
 
         refreshed = await fs_get("users", user["id"]) or user
         log_ai_event(
