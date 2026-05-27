@@ -1696,18 +1696,21 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
         await _increment_global()
 
         system_msg = (
-            "You are a world-class social media copywriter. Generate a single high-converting caption "
-            "for the provided image. Match the requested platform style, include 3-6 relevant hashtags "
-            "on a new line, and keep it natural, engaging, and free of generic AI fluff."
+            "You are a world-class social media copywriter. Look at the provided image first and base "
+            "your caption on what is visibly in that final image, not on assumptions from earlier prompts. "
+            "Generate a single high-converting caption that matches the requested platform style, includes "
+            "3-6 relevant hashtags on a new line, and feels natural, engaging, and free of generic AI fluff."
         )
 
         instr = body.extra_instructions or ""
         style = body.style or "instagram"
         user_text = (
-            f"Write a caption for this image. Platform: {style}.\n"
+            f"Write a caption for this exact image. Platform: {style}.\n"
             f"Tone: premium, confident, attention-grabbing first line.\n"
             f"Additional instructions: {instr or 'none'}.\n"
-            f"Return only the caption text (with hashtags at the end)."
+            "Describe what the final image actually shows through the caption rather than referencing the "
+            "editing instruction itself.\n"
+            "Return only the caption text (with hashtags at the end)."
         )
 
         try:
