@@ -70,16 +70,53 @@ def _resolve_kie_image_model(has_source_image: bool) -> str:
         "gpt image 2 1k",
         "gpt-image-2-1k",
         "gpt image 2, 1k",
+        "gpt-image-2-image-to-image",
+        "gpt-image-2-text-to-image",
     }
-    if normalized in gpt_image_aliases:
-        return "gpt image 2, image-to-image, 1k" if has_source_image else "gpt image 2, text-to-image, 1k"
-
-    if "gpt image 2" in normalized:
-        if has_source_image:
-            return "gpt image 2, image-to-image, 1k"
-        return "gpt image 2, text-to-image, 1k"
+    if normalized in gpt_image_aliases or "gpt image 2" in normalized:
+        return "gpt-image-2-image-to-image" if has_source_image else "gpt-image-2-text-to-image"
 
     return raw
+
+
+def _fit_image_for_firestore(raw: bytes, mime_hint: str) -> tuple[bytes, str]:
+    # Firestore document size is about 1 MiB and base64 expands payload size,
+    # so keep the stored image bytes comfortably below that limit.
+    target_max_bytes = 700 * 1024
+    data, out_mime = _normalize_image(raw, mime_hint)
+    if len(data) <= target_max_bytes:
+        return data, out_mime
+
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception:
+        return data, out_mime
+
+    image = image.convert("RGB")
+    for quality in (78, 68, 58, 48, 40):
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=quality, optimize=True)
+        candidate = out.getvalue()
+        if len(candidate) <= target_max_bytes:
+            return candidate, "image/jpeg"
+
+    # Last resort: scale down again and save smaller JPEG.
+    w, h = image.size
+    scale = 0.85
+    while max(w, h) > 720:
+        w = max(1, int(w * scale))
+        h = max(1, int(h * scale))
+        resized = image.resize((w, h), Image.LANCZOS)
+        out = io.BytesIO()
+        resized.save(out, format="JPEG", quality=44, optimize=True)
+        candidate = out.getvalue()
+        if len(candidate) <= target_max_bytes:
+            return candidate, "image/jpeg"
+
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=36, optimize=True)
+    return out.getvalue(), "image/jpeg"
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -568,8 +605,30 @@ def _extract_result_urls(result_json) -> list[str]:
             return [str(item) for item in result_json["resultUrls"] if item]
         if isinstance(result_json.get("images"), list):
             return [str(item) for item in result_json["images"] if item]
+        data = result_json.get("data")
+        if isinstance(data, dict):
+            if isinstance(data.get("resultUrls"), list):
+                return [str(item) for item in data["resultUrls"] if item]
+            if isinstance(data.get("images"), list):
+                return [str(item) for item in data["images"] if item]
+        output = result_json.get("output")
+        if isinstance(output, dict):
+            if isinstance(output.get("images"), list):
+                return [
+                    str(item.get("url") if isinstance(item, dict) else item)
+                    for item in output["images"]
+                    if item
+                ]
     if isinstance(result_json, list):
-        return [str(item) for item in result_json if item]
+        urls: list[str] = []
+        for item in result_json:
+            if isinstance(item, dict):
+                candidate = item.get("url") or item.get("imageUrl") or item.get("image_url")
+                if candidate:
+                    urls.append(str(candidate))
+            elif item:
+                urls.append(str(item))
+        return urls
     return []
 
 
@@ -677,7 +736,8 @@ async def _wait_for_kie_image(task_id: str) -> tuple[str, str]:
                 raise HTTPException(status_code=502, detail="Image provider finished without returning an image URL.")
             image_bytes, content_type = await _get_binary(urls[0])
             mime_type = content_type or mimetypes.guess_type(urls[0])[0] or "image/png"
-            return base64.b64encode(image_bytes).decode("utf-8"), mime_type
+            stored_bytes, stored_mime = _fit_image_for_firestore(image_bytes, mime_type)
+            return base64.b64encode(stored_bytes).decode("utf-8"), stored_mime
         if state == "fail":
             raise HTTPException(status_code=502, detail=f"Image provider error: {job.get('failMsg') or 'Image generation failed.'}")
         if asyncio.get_running_loop().time() >= deadline:
