@@ -1485,7 +1485,10 @@ async def get_session(session_id: str, user: dict = Depends(get_current_user)):
         sess = None
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
-    msgs = await fs_query("chat_messages", filters=[("session_id", "==", session_id), ("user_id", "==", user["id"])], order_by="created_at", limit=1000)
+    # Avoid requiring a composite Firestore index for session_id + user_id + created_at.
+    msgs = await fs_query("chat_messages", filters=[("session_id", "==", session_id)], limit=1000)
+    msgs = [msg for msg in msgs if msg.get("user_id") == user["id"]]
+    msgs.sort(key=lambda msg: msg.get("created_at") or "")
     return {"session": sess, "messages": msgs}
 
 
@@ -1494,7 +1497,8 @@ async def delete_session(session_id: str, user: dict = Depends(get_current_user)
     sess = await fs_get("chat_sessions", session_id)
     if sess and sess.get("user_id") == user["id"]:
         await fs_delete("chat_sessions", session_id)
-    msgs = await fs_query("chat_messages", filters=[("session_id", "==", session_id), ("user_id", "==", user["id"])], limit=2000)
+    msgs = await fs_query("chat_messages", filters=[("session_id", "==", session_id)], limit=2000)
+    msgs = [msg for msg in msgs if msg.get("user_id") == user["id"]]
     for msg in msgs:
         await fs_delete("chat_messages", msg["id"])
     return {"ok": True}
