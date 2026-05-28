@@ -1392,6 +1392,16 @@ async def meta_oauth_callback(
 ):
     state_doc = await fs_get("oauth_states", state) if state else None
     app_redirect = (state_doc or {}).get("app_redirect_uri") or META_APP_REDIRECT_URI
+    if state_doc and state_doc.get("selection_id"):
+        return _meta_redirect_with_status(
+            app_redirect,
+            status_value=state_doc.get("status") or "needs_selection",
+            message="Choose the page/account to connect.",
+            extra={
+                "selection_id": state_doc.get("selection_id"),
+                "requested_platform": state_doc.get("platform", "facebook"),
+            },
+        )
     if error:
         return _meta_redirect_with_status(app_redirect, status_value="error", message=error_message or error)
     if not state_doc:
@@ -1428,9 +1438,14 @@ async def meta_oauth_callback(
             "profile": profile,
             "page_options": options,
             "access_token": access_token,
+            "oauth_state": state,
             "created_at": utcnow().isoformat(),
         }, merge=False)
-        await fs_delete("oauth_states", state)
+        await fs_set("oauth_states", state, {
+            "selection_id": selection_id,
+            "status": "needs_selection",
+            "used_at": utcnow().isoformat(),
+        }, merge=True)
         return _meta_redirect_with_status(
             app_redirect,
             status_value="needs_selection",
@@ -1495,6 +1510,8 @@ async def select_meta_connection_option(selection_id: str, data: MetaConnectionS
             },
         )
         connected.append("instagram")
+    if doc.get("oauth_state"):
+        await fs_delete("oauth_states", doc["oauth_state"])
     await fs_delete("meta_connection_options", selection_id)
     return {"connected_platforms": connected}
 
