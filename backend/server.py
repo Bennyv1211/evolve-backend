@@ -1060,6 +1060,12 @@ class AuthResponse(BaseModel):
     user: UserPublic
 
 
+class ReviewerAuthResponse(BaseModel):
+    custom_token: str
+    reviewer_expires_at: str
+    user: UserPublic
+
+
 class RestorePurchaseBody(BaseModel):
     receipt: Optional[str] = None
 
@@ -1177,6 +1183,57 @@ async def firebase_auth_exchange(body: FirebaseAuthBody):
     user = await fs_user_upsert_from_firebase(firebase_uid, email, name)
     await sync_user_profile(user)
     return AuthResponse(token=body.id_token, user=UserPublic(**user))
+
+
+@api_router.post("/auth/reviewer", response_model=ReviewerAuthResponse)
+async def reviewer_auth_exchange():
+    if _initialize_firebase() is None:
+        raise HTTPException(status_code=503, detail="Firebase Admin is not configured on the server yet.")
+
+    reviewer_uid = f"reviewer-{uuid.uuid4().hex[:12]}"
+    reviewer_email = f"{reviewer_uid}@evolve.local"
+    reviewer_name = "Tester"
+    reviewer_expires_at = (utcnow() + timedelta(hours=24)).isoformat()
+
+    base_user = await fs_user_upsert_from_firebase(reviewer_uid, reviewer_email, reviewer_name)
+    reviewer_user = {
+        **base_user,
+        "name": reviewer_name,
+        "email": reviewer_email,
+        "onboarded": True,
+        "subscription_status": "active",
+        "subscription_expires_at": reviewer_expires_at,
+        "free_prompts_used": 0,
+    }
+    await fs_set(
+        "users",
+        reviewer_uid,
+        {
+            "name": reviewer_name,
+            "email": reviewer_email,
+            "onboarded": True,
+            "subscription_status": "active",
+            "subscription_expires_at": reviewer_expires_at,
+            "free_prompts_used": 0,
+        },
+        merge=True,
+    )
+    saved = await fs_get("users", reviewer_uid) or reviewer_user
+    await sync_user_profile(saved)
+
+    custom_token = await asyncio.to_thread(
+        firebase_auth_admin.create_custom_token,
+        reviewer_uid,
+        {"reviewer": True},
+    )
+    if isinstance(custom_token, bytes):
+        custom_token = custom_token.decode("utf-8")
+
+    return ReviewerAuthResponse(
+        custom_token=custom_token,
+        reviewer_expires_at=reviewer_expires_at,
+        user=UserPublic(**saved),
+    )
 
 
 @api_router.get("/auth/me", response_model=UserPublic)
@@ -1929,9 +1986,13 @@ async def publish_post(body: PublishBody, user: dict = Depends(get_current_user)
     await sync_post_doc(post)
 
     if body.session_id:
+        publish_label = body.platform.title()
+        publish_copy = f"Posted to {publish_label}."
+        if status_value == "published_mock":
+            publish_copy = f"Posted to {publish_label} (mock)."
         await push_message(
             body.session_id, user["id"], "assistant", "publish",
-            content=f"Posted to {body.platform.title()} (mock).",
+            content=publish_copy,
             image_id=body.image_id,
             meta={"post_id": pid, "platform": body.platform, "external_url": post["external_url"]},
         )
@@ -1941,7 +2002,8 @@ async def publish_post(body: PublishBody, user: dict = Depends(get_current_user)
 
 @api_router.get("/posts")
 async def list_posts(user: dict = Depends(get_current_user)):
-    docs = await fs_query("posts", filters=[("user_id", "==", user["id"])], order_by="published_at", descending=True, limit=200)
+    docs = await fs_query("posts", filters=[("user_id", "==", user["id"])], limit=200)
+    docs.sort(key=lambda doc: doc.get("published_at") or "", reverse=True)
     return docs
 
 
