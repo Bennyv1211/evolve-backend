@@ -34,6 +34,8 @@ FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", 
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
 DAILY_PROMPT_LIMIT = int(os.environ.get("DAILY_PROMPT_LIMIT", "10"))
 FREE_PROMPT_LIMIT = int(os.environ.get("FREE_PROMPT_LIMIT", "3"))
+REVIEWER_EMAIL = "reviewer@test.com"
+REVIEWER_PASSWORD = "Test123!"
 OPENAI_TEXT_MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -326,17 +328,59 @@ async def update_subscription_status(
         await sync_user_profile(refreshed)
 
 
+async def bind_installation_to_user(user_id: str, email: str, install_id: Optional[str], *, exempt: bool = False) -> bool:
+    install_id = (install_id or "").strip()
+    if not install_id:
+        return False
+
+    now = utcnow().isoformat()
+    existing = await fs_get("device_installs", install_id)
+    locked = False
+    if existing:
+        owner_user_id = (existing.get("owner_user_id") or "").strip()
+        if owner_user_id and owner_user_id != user_id and not exempt:
+            locked = True
+        await fs_set(
+            "device_installs",
+            install_id,
+            {
+                "last_seen_at": now,
+                "last_user_id": user_id,
+                "last_email": email,
+            },
+            merge=True,
+        )
+    else:
+        await fs_set(
+            "device_installs",
+            install_id,
+            {
+                "id": install_id,
+                "owner_user_id": user_id,
+                "owner_email": email,
+                "created_at": now,
+                "last_seen_at": now,
+                "last_user_id": user_id,
+                "last_email": email,
+            },
+            merge=False,
+        )
+    return locked
+
+
 def entitlement_payload(user: dict) -> dict:
     used = int(user.get("free_prompts_used", 0))
     subscribed = is_user_subscribed(user)
-    remaining = None if subscribed else max(0, FREE_PROMPT_LIMIT - used)
-    paywall_required = False if subscribed else used >= FREE_PROMPT_LIMIT
+    locked = bool(user.get("free_trial_locked")) and not subscribed
+    remaining = None if subscribed else (0 if locked else max(0, FREE_PROMPT_LIMIT - used))
+    paywall_required = False if subscribed else (locked or used >= FREE_PROMPT_LIMIT)
     return {
         "free_prompts_used": used,
         "free_prompts_remaining": remaining,
         "paywall_required": paywall_required,
         "subscription_status": "active" if subscribed else str(user.get("subscription_status") or "free"),
         "subscription_expires_at": user.get("subscription_expires_at"),
+        "free_trial_locked": locked,
     }
 
 
@@ -380,6 +424,10 @@ async def reserve_free_prompt(user: dict) -> dict:
         return refreshed or user
 
     current = await fs_get("users", user["id"]) or user
+    if bool(current.get("free_trial_locked")):
+        payload = entitlement_payload(current)
+        payload["message"] = "Free trial already used on this device. Subscribe to continue."
+        raise HTTPException(status_code=402, detail=payload)
     used = int(current.get("free_prompts_used", 0))
     if used >= FREE_PROMPT_LIMIT:
         raise paywall_exception(current)
@@ -465,6 +513,7 @@ async def sync_user_profile(user_doc: dict):
             "name": user_doc.get("name"),
             "onboarded": bool(user_doc.get("onboarded", False)),
             "free_prompts_used": int(user_doc.get("free_prompts_used", 0)),
+            "free_trial_locked": bool(user_doc.get("free_trial_locked", False)),
             "subscription_status": user_doc.get("subscription_status", "free"),
             "subscription_expires_at": user_doc.get("subscription_expires_at"),
             "created_at": user_doc.get("created_at"),
@@ -1128,6 +1177,12 @@ class LoginBody(BaseModel):
 class FirebaseAuthBody(BaseModel):
     id_token: str
     name: Optional[str] = None
+    install_id: Optional[str] = None
+
+
+class ReviewerAuthBody(BaseModel):
+    email: EmailStr
+    password: str
 
 
 class AuthResponse(BaseModel):
@@ -1247,27 +1302,44 @@ async def firebase_auth_exchange(body: FirebaseAuthBody):
 
     firebase_uid = decoded.get("uid")
     email = (decoded.get("email") or "").strip().lower()
+    reviewer_claim = bool(decoded.get("reviewer"))
+    if reviewer_claim and not email:
+        email = REVIEWER_EMAIL
     if not firebase_uid or not email:
         raise HTTPException(status_code=400, detail="Firebase token did not contain a valid uid/email")
 
     name = (
         body.name
         or decoded.get("name")
+        or ("Tester" if reviewer_claim else None)
         or email.split("@")[0]
     ).strip()[:80]
 
     user = await fs_user_upsert_from_firebase(firebase_uid, email, name)
+    free_trial_locked = await bind_installation_to_user(
+        firebase_uid,
+        email,
+        body.install_id,
+        exempt=(email == REVIEWER_EMAIL),
+    )
+    if free_trial_locked != bool(user.get("free_trial_locked", False)):
+        user["free_trial_locked"] = free_trial_locked
+        await fs_set("users", firebase_uid, {"free_trial_locked": free_trial_locked}, merge=True)
+    else:
+        user["free_trial_locked"] = bool(user.get("free_trial_locked", False))
     await sync_user_profile(user)
     return AuthResponse(token=body.id_token, user=UserPublic(**user))
 
 
 @api_router.post("/auth/reviewer", response_model=ReviewerAuthResponse)
-async def reviewer_auth_exchange():
+async def reviewer_auth_exchange(body: ReviewerAuthBody):
     if _initialize_firebase() is None:
         raise HTTPException(status_code=503, detail="Firebase Admin is not configured on the server yet.")
+    if body.email.strip().lower() != REVIEWER_EMAIL or body.password != REVIEWER_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid reviewer credentials")
 
-    reviewer_uid = f"reviewer-{uuid.uuid4().hex[:12]}"
-    reviewer_email = f"{reviewer_uid}@evolve.local"
+    reviewer_uid = "reviewer-demo-user"
+    reviewer_email = REVIEWER_EMAIL
     reviewer_name = "Tester"
     reviewer_expires_at = (utcnow() + timedelta(hours=24)).isoformat()
 
@@ -1277,9 +1349,10 @@ async def reviewer_auth_exchange():
         "name": reviewer_name,
         "email": reviewer_email,
         "onboarded": True,
-        "subscription_status": "active",
-        "subscription_expires_at": reviewer_expires_at,
+        "subscription_status": "free",
+        "subscription_expires_at": None,
         "free_prompts_used": 0,
+        "free_trial_locked": False,
     }
     await fs_set(
         "users",
@@ -1288,9 +1361,10 @@ async def reviewer_auth_exchange():
             "name": reviewer_name,
             "email": reviewer_email,
             "onboarded": True,
-            "subscription_status": "active",
-            "subscription_expires_at": reviewer_expires_at,
+            "subscription_status": "free",
+            "subscription_expires_at": None,
             "free_prompts_used": 0,
+            "free_trial_locked": False,
         },
         merge=True,
     )
