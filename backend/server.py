@@ -1509,16 +1509,6 @@ async def meta_oauth_callback(
 ):
     state_doc = await fs_get("oauth_states", state) if state else None
     app_redirect = (state_doc or {}).get("app_redirect_uri") or META_APP_REDIRECT_URI
-    if state_doc and state_doc.get("selection_id"):
-        return _meta_redirect_with_status(
-            app_redirect,
-            status_value=state_doc.get("status") or "needs_selection",
-            message="Choose the page/account to connect.",
-            extra={
-                "selection_id": state_doc.get("selection_id"),
-                "requested_platform": state_doc.get("platform", "facebook"),
-            },
-        )
     if error:
         return _meta_redirect_with_status(app_redirect, status_value="error", message=error_message or error)
     if not state_doc:
@@ -1547,27 +1537,67 @@ async def meta_oauth_callback(
                     "instagram_account": page_detail.get("instagram_business_account"),
                 }
             )
-        selection_id = str(uuid.uuid4())
-        await fs_set("meta_connection_options", selection_id, {
-            "id": selection_id,
-            "user_id": state_doc["user_id"],
-            "requested_platform": state_doc.get("platform", "facebook"),
-            "profile": profile,
-            "page_options": options,
-            "access_token": access_token,
-            "oauth_state": state,
-            "created_at": utcnow().isoformat(),
-        }, merge=False)
-        await fs_set("oauth_states", state, {
-            "selection_id": selection_id,
-            "status": "needs_selection",
-            "used_at": utcnow().isoformat(),
-        }, merge=True)
+        requested_platform = state_doc.get("platform", "facebook")
+        if not options:
+            await fs_delete("oauth_states", state)
+            return _meta_redirect_with_status(
+                app_redirect,
+                status_value="error",
+                message="Meta connected, but no eligible Facebook pages were available.",
+            )
+
+        chosen = None
+        if requested_platform == "instagram":
+            for option in options:
+                if option.get("instagram_account"):
+                    chosen = option
+                    break
+            if chosen is None:
+                await fs_delete("oauth_states", state)
+                return _meta_redirect_with_status(
+                    app_redirect,
+                    status_value="error",
+                    message="Meta connected, but no Instagram business account was linked to the available Facebook pages.",
+                )
+        else:
+            chosen = options[0]
+
+        await _upsert_social_connection(
+            user_id=state_doc["user_id"],
+            platform="facebook",
+            account_name=chosen.get("page_name") or "Facebook Page",
+            account_id=chosen["page_id"],
+            access_token=chosen.get("page_access_token") or access_token,
+            metadata={
+                "meta_user_id": (profile or {}).get("id"),
+                "meta_user_name": (profile or {}).get("name"),
+                "meta_user_email": (profile or {}).get("email"),
+            },
+        )
+        connected = ["facebook"]
+
+        instagram_account = chosen.get("instagram_account")
+        if instagram_account:
+            await _upsert_social_connection(
+                user_id=state_doc["user_id"],
+                platform="instagram",
+                account_name=instagram_account.get("username") or instagram_account.get("name") or "Instagram Business",
+                account_id=instagram_account["id"],
+                access_token=chosen.get("page_access_token") or access_token,
+                metadata={
+                    "facebook_page_id": chosen["page_id"],
+                    "facebook_page_name": chosen.get("page_name"),
+                },
+            )
+            connected.append("instagram")
+
+        await fs_delete("oauth_states", state)
         return _meta_redirect_with_status(
             app_redirect,
-            status_value="needs_selection",
-            message="Choose the page/account to connect.",
-            extra={"selection_id": selection_id, "requested_platform": state_doc.get("platform", "facebook")},
+            status_value="success",
+            message="Meta account connected.",
+            platforms=",".join(connected),
+            extra={"requested_platform": requested_platform},
         )
     except HTTPException as exc:
         await fs_delete("oauth_states", state)
