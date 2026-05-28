@@ -7,6 +7,8 @@ import json
 import html
 import logging
 import mimetypes
+import re
+import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
@@ -1059,6 +1061,47 @@ def _normalize_image(raw: bytes, mime_hint: str) -> tuple[bytes, str]:
     return data, out_mime
 
 
+def _clean_caption_text(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+
+    replacements = {
+        "â€™": "'",
+        "â€˜": "'",
+        'â€œ': '"',
+        'â€\x9d': '"',
+        "â€”": "-",
+        "â€“": "-",
+        "â€¦": "...",
+        "Â ": " ",
+        "Â": "",
+        "Ã©": "é",
+        "Ã¨": "è",
+        "Ãª": "ê",
+        "Ã¡": "á",
+        "Ã ": "à",
+        "Ã³": "ó",
+        "Ãº": "ú",
+        "Ã±": "ñ",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    if "Ã" in text or "Â" in text or "â" in text:
+        try:
+            repaired = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if repaired:
+                text = repaired
+        except Exception:
+            pass
+
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # ---------- Models ----------
 class UserPublic(BaseModel):
     id: str
@@ -1855,6 +1898,7 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
 
         try:
             caption = await _openai_responses_text(user_text, img["data_b64"], img.get("mime", "image/png"), system_msg)
+            caption = _clean_caption_text(caption)
         except Exception as e:
             logger.exception("Caption generation failed")
             log_ai_event(
@@ -1899,7 +1943,7 @@ async def save_caption_message(body: SaveCaptionMessageBody, user: dict = Depend
         raise HTTPException(status_code=404, detail="Session not found")
     msg = await push_message(
         body.session_id, user["id"], "assistant", "caption",
-        content=body.caption, image_id=body.image_id,
+        content=_clean_caption_text(body.caption), image_id=body.image_id,
         suggestions=["Approve & publish", "Regenerate caption", "Edit caption"],
     )
     return msg
