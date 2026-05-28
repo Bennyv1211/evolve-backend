@@ -34,7 +34,7 @@ FREE_PROMPT_LIMIT = int(os.environ.get("FREE_PROMPT_LIMIT", "3"))
 OPENAI_TEXT_MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "gpt-image-2")
+KIE_IMAGE_MODEL = os.environ.get("KIE_IMAGE_MODEL", "nano-banana-2")
 KIE_MAX_IMAGES_PER_REQUEST = int(os.environ.get("KIE_MAX_IMAGES_PER_REQUEST", "1"))
 KIE_API_KEY = os.environ.get("KIE_API_KEY", "")
 KIE_API_BASE_URL = os.environ.get("KIE_API_BASE_URL", "https://api.kie.ai").rstrip("/")
@@ -75,6 +75,9 @@ def _resolve_kie_image_model(has_source_image: bool) -> str:
     }
     if normalized in gpt_image_aliases or "gpt image 2" in normalized:
         return "gpt-image-2-image-to-image" if has_source_image else "gpt-image-2-text-to-image"
+
+    if normalized in {"nano-banana-2", "nanobanana2", "nano banana 2"}:
+        return "nano-banana-2"
 
     return raw
 
