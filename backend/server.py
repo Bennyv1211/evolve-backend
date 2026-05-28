@@ -4,6 +4,7 @@ import uuid
 import base64
 import asyncio
 import json
+import html
 import logging
 import mimetypes
 from pathlib import Path
@@ -16,7 +17,7 @@ import requests
 import firebase_admin
 from PIL import Image
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, Form, Request
-from fastapi.responses import Response, RedirectResponse, JSONResponse
+from fastapi.responses import Response, RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from firebase_admin import auth as firebase_auth_admin, credentials, firestore
@@ -530,7 +531,38 @@ def _meta_redirect_with_status(
     params = {"status": status_value, "message": message, "platforms": platforms}
     if extra:
         params.update({k: v for k, v in extra.items() if v is not None})
-    return RedirectResponse(f"{app_redirect_uri}{separator}{urlencode(params)}", status_code=302)
+    target = f"{app_redirect_uri}{separator}{urlencode(params)}"
+    escaped_target = html.escape(target, quote=True)
+    escaped_message = html.escape(message or "Returning to Evolve…")
+    markup = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Evolve Connection</title>
+    <script>
+      window.location.replace("{escaped_target}");
+      setTimeout(function() {{
+        window.location.href = "{escaped_target}";
+      }}, 250);
+    </script>
+    <style>
+      body {{ font-family: Arial, sans-serif; background:#0b0b0d; color:#fff; padding:32px; }}
+      .card {{ max-width:540px; margin:12vh auto 0; background:#15151a; border:1px solid rgba(255,255,255,.08);
+               border-radius:24px; padding:28px; }}
+      a {{ color:#f54e8a; }}
+      p {{ color:#c8c8ce; line-height:1.5; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Returning to Evolve</h2>
+      <p>{escaped_message}</p>
+      <p>If the app does not open automatically, <a href="{escaped_target}">tap here</a>.</p>
+    </div>
+  </body>
+</html>"""
+    return HTMLResponse(content=markup, status_code=200)
 
 
 async def _get_json(url: str, *, headers: Optional[dict] = None, timeout: int = 60) -> dict:
@@ -1109,6 +1141,7 @@ class EditImageBody(BaseModel):
 
 
 class CaptionBody(BaseModel):
+    session_id: str
     image_id: str
     style: Optional[str] = Field(default="instagram", max_length=40)
     extra_instructions: Optional[str] = Field(default="", max_length=MAX_PROMPT_CHARS)
@@ -1764,18 +1797,26 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
         img = None
     if not img:
         raise HTTPException(status_code=404, detail="Image not found")
+    sess = await fs_get("chat_sessions", body.session_id)
+    if sess and sess.get("user_id") != user["id"]:
+        sess = None
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
 
     lock = _user_lock(user["id"])
     if lock.locked():
         raise HTTPException(status_code=429, detail="An AI request is already running. Please wait.")
 
     async with lock:
-        _enforce_rate_limit(user["id"])
-        await enforce_prompt_quota(user["id"])
-        await _enforce_global_cap()
-        user = await reserve_free_prompt(user)
-        await increment_usage(user["id"])
-        await _increment_global()
+        prior_messages = await fs_query("chat_messages", filters=[("session_id", "==", body.session_id)], limit=500)
+        session_caption_count = sum(
+            1 for msg in prior_messages if msg.get("user_id") == user["id"] and msg.get("kind") == "caption"
+        )
+        if session_caption_count >= 15:
+            raise HTTPException(
+                status_code=429,
+                detail="Caption regenerate limit reached for this session (15). Start a new session to continue.",
+            )
 
         system_msg = (
             "You are a world-class social media copywriter. Look at the provided image first and base "
@@ -1798,9 +1839,6 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
         try:
             caption = await _openai_responses_text(user_text, img["data_b64"], img.get("mime", "image/png"), system_msg)
         except Exception as e:
-            await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
-            await _decrement_global()
             logger.exception("Caption generation failed")
             log_ai_event(
                 user_id=user["id"],
@@ -1810,6 +1848,7 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
                 image_count=1,
                 success=False,
                 user=user,
+                estimated_cost="caption-only",
             )
             raise HTTPException(status_code=502, detail=f"Caption generation failed: {str(e)[:200]}")
 
@@ -1822,6 +1861,7 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
             image_count=1,
             success=True,
             user=refreshed,
+            estimated_cost="caption-only",
         )
 
         return {"caption": caption, "style": style, "image_id": body.image_id, **entitlement_payload(refreshed)}
