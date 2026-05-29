@@ -1145,8 +1145,17 @@ def _clean_caption_text(raw: str) -> str:
         except Exception:
             pass
 
+    if "Ã" in text or "Â" in text or "â" in text or "\ufffd" in text:
+        try:
+            repaired = text.encode("cp1252", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if repaired:
+                text = repaired
+        except Exception:
+            pass
+
     text = text.replace("\ufffd", "")
     text = re.sub(r"(?:Ã.|Â.|â.|¢|¤|¦|¨|©|ª|«|¬|®|¯)+", "", text)
+    text = re.sub(r"\S*[ÃÂâ�]\S*", "", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"[ \t]+", " ", text)
