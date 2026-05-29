@@ -1145,6 +1145,9 @@ def _clean_caption_text(raw: str) -> str:
         except Exception:
             pass
 
+    text = text.replace("\ufffd", "")
+    text = re.sub(r"(?:Ã.|Â.|â.|¢|¤|¦|¨|©|ª|«|¬|®|¯)+", "", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -2210,6 +2213,16 @@ async def list_posts(user: dict = Depends(get_current_user)):
     docs = await fs_query("posts", filters=[("user_id", "==", user["id"])], limit=200)
     docs.sort(key=lambda doc: doc.get("published_at") or "", reverse=True)
     return docs
+
+
+@api_router.delete("/posts/{post_id}")
+async def delete_post(post_id: str, user: dict = Depends(get_current_user)):
+    post = await fs_get("posts", post_id)
+    if not post or post.get("user_id") != user["id"]:
+        raise HTTPException(status_code=404, detail="Post not found")
+    await fs_delete("posts", post_id)
+    await _firestore_delete(["users", user["id"], "posts", post_id])
+    return {"ok": True}
 
 
 # ---------- Mount router ----------
