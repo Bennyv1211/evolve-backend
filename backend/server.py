@@ -1163,6 +1163,40 @@ def _clean_caption_text(raw: str) -> str:
     return text.strip()
 
 
+def _finalize_caption_text(raw: str) -> str:
+    text = _clean_caption_text(raw)
+    if not text:
+        return text
+
+    def _repair_once(value: str) -> str:
+        for source in ("latin1", "cp1252"):
+            try:
+                repaired = value.encode(source, errors="ignore").decode("utf-8", errors="ignore").strip()
+                if repaired and repaired != value:
+                    return repaired
+            except Exception:
+                continue
+        return value
+
+    for _ in range(3):
+        repaired = _repair_once(text)
+        if repaired == text:
+            break
+        text = repaired
+
+    text = text.replace("â€™", "'").replace("â€˜", "'")
+    text = text.replace("â€œ", '"').replace("â€", '"')
+    text = text.replace("â€“", "-").replace("â€”", "-").replace("â€¦", "...")
+    text = text.replace("â€¢", "-").replace("\ufffd", "")
+    text = re.sub(r"(?:Ãƒ.|Ã‚.|Ã¢.|Â¢|Â¤|Â¦|Â¨|Â©|Âª|Â«|Â¬|Â®|Â¯|â€.|â€™|â€œ|â€|â€“|â€”|â€¦)+", "", text)
+    text = re.sub(r"\S*[ÃƒÃ‚Ã¢âï¿½][^\s#,.!?;:)]*", "", text)
+    text = re.sub(r"[^\S\r\n]*[ÂÃâ][^\s#,.!?;:)]*", "", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip()
+
+
 # ---------- Models ----------
 class UserPublic(BaseModel):
     id: str
@@ -1869,6 +1903,9 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
         await push_message(session_id, user["id"], "user", "text", content=prompt)
 
         image_b64 = None
+        img = None
+        if not image_id:
+            image_id = (sess or {}).get("cover_image_id")
         if image_id:
             img = await fs_get("images", image_id)
             if img and img.get("user_id") != user["id"]:
@@ -1887,12 +1924,27 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
                 raise HTTPException(status_code=400, detail="Image editing requires an uploaded source image.")
             source_mime = img.get("mime", "image/png") if image_id and img else "image/png"
             new_b64, new_mime = await _generate_kie_image(prompt, image_b64, source_mime)
-        except Exception as e:
+        except HTTPException as e:
             # Refund on failure
             await refund_free_prompt(user["id"])
             await _decrement_user_usage(user["id"])
             await _decrement_global()
-            logger.exception("Gemini image edit failed")
+            logger.exception("KIE image edit failed")
+            log_ai_event(
+                user_id=user["id"],
+                provider="kie",
+                model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
+                prompt_length=len(prompt),
+                image_count=1 if image_b64 else 0,
+                success=False,
+                user=user,
+            )
+            raise e
+        except Exception as e:
+            await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"])
+            await _decrement_global()
+            logger.exception("KIE image edit failed")
             log_ai_event(
                 user_id=user["id"],
                 provider="kie",
@@ -2014,7 +2066,7 @@ async def generate_caption(body: CaptionBody, user: dict = Depends(get_current_u
 
         try:
             caption = await _openai_responses_text(user_text, img["data_b64"], img.get("mime", "image/png"), system_msg)
-            caption = _clean_caption_text(caption)
+            caption = _finalize_caption_text(caption)
         except Exception as e:
             logger.exception("Caption generation failed")
             log_ai_event(
@@ -2059,7 +2111,7 @@ async def save_caption_message(body: SaveCaptionMessageBody, user: dict = Depend
         raise HTTPException(status_code=404, detail="Session not found")
     msg = await push_message(
         body.session_id, user["id"], "assistant", "caption",
-        content=_clean_caption_text(body.caption), image_id=body.image_id,
+        content=_finalize_caption_text(body.caption), image_id=body.image_id,
         suggestions=["Approve & publish", "Regenerate caption", "Edit caption"],
     )
     return msg
