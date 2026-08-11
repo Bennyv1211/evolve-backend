@@ -47,6 +47,10 @@ KIE_UPLOAD_BASE_URL = os.environ.get("KIE_UPLOAD_BASE_URL", "https://kieai.redpa
 KIE_IMAGE_RESOLUTION = os.environ.get("KIE_IMAGE_RESOLUTION", "1K")
 KIE_IMAGE_FORMAT = os.environ.get("KIE_IMAGE_FORMAT", "png")
 KIE_IMAGE_ASPECT_RATIO = os.environ.get("KIE_IMAGE_ASPECT_RATIO", "auto")
+KIE_VIDEO_MODEL = os.environ.get("KIE_VIDEO_MODEL", "bytedance/seedance-2-mini")
+KIE_VIDEO_RESOLUTION = os.environ.get("KIE_VIDEO_RESOLUTION", "720p")
+KIE_VIDEO_DURATION_SECONDS = int(os.environ.get("KIE_VIDEO_DURATION_SECONDS", "5"))
+KIE_VIDEO_ASPECT_RATIO = os.environ.get("KIE_VIDEO_ASPECT_RATIO", "9:16")
 KIE_POLL_INTERVAL_SECONDS = float(os.environ.get("KIE_POLL_INTERVAL_SECONDS", "2.5"))
 KIE_POLL_TIMEOUT_SECONDS = int(os.environ.get("KIE_POLL_TIMEOUT_SECONDS", "180"))
 META_APP_ID = os.environ.get("META_APP_ID", "").strip()
@@ -63,6 +67,8 @@ MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "1000"))
 MAX_AI_PER_MINUTE_PER_USER = int(os.environ.get("MAX_AI_PER_MINUTE_PER_USER", "3"))
 GLOBAL_DAILY_AI_CAP = int(os.environ.get("GLOBAL_DAILY_AI_CAP", "500"))            # all users combined
 REGISTRATIONS_PER_HOUR_PER_IP = int(os.environ.get("REGISTRATIONS_PER_HOUR_PER_IP", "5"))
+FREE_VIDEO_LIMIT = int(os.environ.get("FREE_VIDEO_LIMIT", "0"))
+PREMIUM_VIDEO_LIMIT = int(os.environ.get("PREMIUM_VIDEO_LIMIT", "2"))
 
 
 def _resolve_kie_image_model(has_source_image: bool) -> str:
@@ -84,6 +90,19 @@ def _resolve_kie_image_model(has_source_image: bool) -> str:
     if normalized in {"nano-banana-2", "nanobanana2", "nano banana 2"}:
         return "nano-banana-2"
 
+    return raw
+
+
+def _resolve_kie_video_model() -> str:
+    raw = (KIE_VIDEO_MODEL or "").strip()
+    normalized = raw.lower()
+    if normalized in {
+        "seedance-2-mini",
+        "bytedance/seedance-2-mini",
+        "seedance 2 mini",
+        "seedance2mini",
+    }:
+        return "bytedance/seedance-2-mini"
     return raw
 
 
@@ -390,30 +409,61 @@ def paywall_exception(user: dict) -> HTTPException:
     return HTTPException(status_code=402, detail=payload)
 
 
-async def get_usage_today(user_id: str) -> int:
-    doc = await fs_get("usage", _fs_doc_id(user_id, today_key()))
-    return int(doc["count"]) if doc else 0
-
-
-async def increment_usage(user_id: str) -> int:
+async def get_usage_doc_today(user_id: str) -> dict:
     doc_id = _fs_doc_id(user_id, today_key())
-    existing = await fs_get("usage", doc_id)
+    return await fs_get("usage", doc_id) or {}
+
+
+async def get_usage_today(user_id: str) -> int:
+    doc = await get_usage_doc_today(user_id)
+    return int(doc.get("count", 0))
+
+
+async def get_video_usage_today(user_id: str) -> int:
+    doc = await get_usage_doc_today(user_id)
+    return int(doc.get("video_count", 0))
+
+
+async def increment_usage(user_id: str, *, kind: Literal["image", "video"] = "image") -> int:
+    doc_id = _fs_doc_id(user_id, today_key())
+    existing = await get_usage_doc_today(user_id)
+    next_image_count = int(existing.get("count", 0))
+    next_video_count = int(existing.get("video_count", 0))
+    if kind == "image":
+        next_image_count += 1
+    else:
+        next_video_count += 1
     res = {
         "id": doc_id,
         "user_id": user_id,
         "date": today_key(),
-        "count": int(existing.get("count", 0)) + 1 if existing else 1,
+        "count": next_image_count,
+        "video_count": next_video_count,
         "created_at": existing.get("created_at", utcnow().isoformat()) if existing else utcnow().isoformat(),
     }
     await fs_set("usage", doc_id, res, merge=False)
     await sync_usage_record(user_id)
-    return int(res["count"])
+    return int(res["count"] if kind == "image" else res["video_count"])
 
 
 async def enforce_prompt_quota(user_id: str):
     used = await get_usage_today(user_id)
     if used >= DAILY_PROMPT_LIMIT:
         raise HTTPException(status_code=429, detail=f"Daily limit of {DAILY_PROMPT_LIMIT} prompts reached. Try again tomorrow.")
+
+
+async def enforce_video_quota(user: dict):
+    if not is_user_subscribed(user):
+        payload = entitlement_payload(user)
+        payload["message"] = "Video generation is a premium feature."
+        raise HTTPException(status_code=402, detail=payload)
+    used = await get_video_usage_today(user["id"])
+    limit = PREMIUM_VIDEO_LIMIT if is_user_subscribed(user) else FREE_VIDEO_LIMIT
+    if used >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily video limit of {limit} reached. Try again tomorrow.",
+        )
 
 
 async def reserve_free_prompt(user: dict) -> dict:
@@ -558,6 +608,21 @@ async def sync_image_doc(doc: dict):
             "user_id": doc["user_id"],
             "mime": doc.get("mime"),
             "source": doc.get("source"),
+            "meta": doc.get("meta", {}),
+            "created_at": doc.get("created_at"),
+        },
+    )
+
+
+async def sync_video_doc(doc: dict):
+    await _firestore_set(
+        ["users", doc["user_id"], "videos", doc["id"]],
+        {
+            "id": doc["id"],
+            "user_id": doc["user_id"],
+            "mime": doc.get("mime"),
+            "source": doc.get("source"),
+            "source_url": doc.get("source_url"),
             "meta": doc.get("meta", {}),
             "created_at": doc.get("created_at"),
         },
@@ -709,12 +774,63 @@ def _extract_result_urls(result_json) -> list[str]:
         urls: list[str] = []
         for item in result_json:
             if isinstance(item, dict):
-                candidate = item.get("url") or item.get("imageUrl") or item.get("image_url")
+                candidate = (
+                    item.get("url")
+                    or item.get("imageUrl")
+                    or item.get("image_url")
+                    or item.get("videoUrl")
+                    or item.get("video_url")
+                )
                 if candidate:
                     urls.append(str(candidate))
             elif item:
                 urls.append(str(item))
         return urls
+    return []
+
+
+def _extract_result_media_urls(result_json) -> list[str]:
+    urls = _extract_result_urls(result_json)
+    if urls:
+        return urls
+    if isinstance(result_json, str):
+        try:
+            result_json = json.loads(result_json)
+        except Exception:
+            return []
+    if isinstance(result_json, dict):
+        for key in ("videoUrl", "video_url"):
+            value = result_json.get(key)
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+        for key in ("videos", "video_urls"):
+            value = result_json.get(key)
+            if isinstance(value, list):
+                return [str(item) for item in value if item]
+        data = result_json.get("data")
+        if isinstance(data, dict):
+            for key in ("videoUrl", "video_url"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return [value.strip()]
+            for key in ("videos", "video_urls"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [str(item) for item in value if item]
+        output = result_json.get("output")
+        if isinstance(output, dict):
+            for key in ("videoUrl", "video_url"):
+                value = output.get(key)
+                if isinstance(value, str) and value.strip():
+                    return [value.strip()]
+            for key in ("videos", "video_urls"):
+                value = output.get(key)
+                if isinstance(value, list):
+                    return [
+                        str(item.get("url") if isinstance(item, dict) else item)
+                        for item in value
+                        if item
+                    ]
     return []
 
 
@@ -773,15 +889,39 @@ async def _upload_kie_base64_image(image_b64: str, mime_type: str) -> str:
     return download_url
 
 
-async def _create_kie_image_task(prompt: str, image_b64: str, mime_type: str) -> str:
+def _build_kie_edit_prompt(prompt: str, has_logo: bool) -> str:
+    if not has_logo:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "Branding instruction: the second uploaded reference image is the user's logo. "
+        "Include that exact logo in the final design naturally and professionally. "
+        "Preserve the logo's identity, colors, proportions, and wording. "
+        "Do not distort, replace, or invent a different logo."
+    )
+
+
+async def _create_kie_image_task(
+    prompt: str,
+    image_b64: str,
+    mime_type: str,
+    *,
+    logo_image_b64: Optional[str] = None,
+    logo_mime_type: Optional[str] = None,
+) -> str:
     require_config(KIE_API_KEY, "KIE_API_KEY")
     source_image_url = await _upload_kie_base64_image(image_b64, mime_type)
+    image_inputs = [source_image_url]
+    if logo_image_b64:
+        resolved_logo_mime = logo_mime_type or "image/png"
+        logo_image_url = await _upload_kie_base64_image(logo_image_b64, resolved_logo_mime)
+        image_inputs.append(logo_image_url)
     resolved_model = _resolve_kie_image_model(has_source_image=True)
     payload = {
         "model": resolved_model,
         "input": {
-            "prompt": prompt,
-            "image_input": [source_image_url],
+            "prompt": _build_kie_edit_prompt(prompt, bool(logo_image_b64)),
+            "image_input": image_inputs,
             "aspect_ratio": KIE_IMAGE_ASPECT_RATIO,
             "resolution": KIE_IMAGE_RESOLUTION,
             "output_format": KIE_IMAGE_FORMAT,
@@ -831,9 +971,82 @@ async def _wait_for_kie_image(task_id: str) -> tuple[str, str]:
         await asyncio.sleep(KIE_POLL_INTERVAL_SECONDS)
 
 
-async def _generate_kie_image(prompt: str, image_b64: str, mime_type: str) -> tuple[str, str]:
-    task_id = await _create_kie_image_task(prompt, image_b64, mime_type)
+async def _generate_kie_image(
+    prompt: str,
+    image_b64: str,
+    mime_type: str,
+    *,
+    logo_image_b64: Optional[str] = None,
+    logo_mime_type: Optional[str] = None,
+) -> tuple[str, str]:
+    task_id = await _create_kie_image_task(
+        prompt,
+        image_b64,
+        mime_type,
+        logo_image_b64=logo_image_b64,
+        logo_mime_type=logo_mime_type,
+    )
     return await _wait_for_kie_image(task_id)
+
+
+async def _create_kie_video_task(prompt: str, image_b64: str, mime_type: str) -> str:
+    require_config(KIE_API_KEY, "KIE_API_KEY")
+    source_image_url = await _upload_kie_base64_image(image_b64, mime_type)
+    resolved_model = _resolve_kie_video_model()
+    payload = {
+        "model": resolved_model,
+        "input": {
+            "prompt": prompt,
+            "first_frame_url": source_image_url,
+            "resolution": KIE_VIDEO_RESOLUTION,
+            "duration": KIE_VIDEO_DURATION_SECONDS,
+            "aspect_ratio": KIE_VIDEO_ASPECT_RATIO,
+        },
+    }
+    data = await _post_json(
+        f"{KIE_API_BASE_URL}/api/v1/jobs/createTask",
+        headers={"Authorization": f"Bearer {KIE_API_KEY}"},
+        payload=payload,
+        timeout=60,
+    )
+    task_id = _extract_kie_task_id(data)
+    if not task_id:
+        provider_error = _extract_kie_error(data)
+        if provider_error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Video provider error: {provider_error} (model sent: {resolved_model})",
+            )
+        raise HTTPException(status_code=502, detail="Video provider did not return a task ID.")
+    return task_id
+
+
+async def _wait_for_kie_video(task_id: str) -> str:
+    deadline = asyncio.get_running_loop().time() + KIE_POLL_TIMEOUT_SECONDS
+    headers = {"Authorization": f"Bearer {KIE_API_KEY}"}
+    while True:
+        data = await _get_json(
+            f"{KIE_API_BASE_URL}/api/v1/jobs/recordInfo?taskId={task_id}",
+            headers=headers,
+            timeout=60,
+        )
+        job = (data or {}).get("data") or {}
+        state = job.get("state")
+        if state == "success":
+            urls = _extract_result_media_urls(job.get("resultJson"))
+            if not urls:
+                raise HTTPException(status_code=502, detail="Video provider finished without returning a video URL.")
+            return urls[0]
+        if state == "fail":
+            raise HTTPException(status_code=502, detail=f"Video provider error: {job.get('failMsg') or 'Video generation failed.'}")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise HTTPException(status_code=504, detail="Video generation timed out.")
+        await asyncio.sleep(KIE_POLL_INTERVAL_SECONDS)
+
+
+async def _generate_kie_video(prompt: str, image_b64: str, mime_type: str) -> str:
+    task_id = await _create_kie_video_task(prompt, image_b64, mime_type)
+    return await _wait_for_kie_video(task_id)
 
 
 async def _openai_responses_text(prompt_text: str, image_b64: str, mime_type: str, system_text: str) -> str:
@@ -1031,12 +1244,15 @@ async def _increment_global():
     )
 
 
-async def _decrement_user_usage(user_id: str):
-    """Refund a prompt if the AI call failed AFTER the reservation."""
+async def _decrement_user_usage(user_id: str, *, kind: Literal["image", "video"] = "image"):
+    """Refund usage if the AI call failed after reservation."""
     doc_id = _fs_doc_id(user_id, today_key())
     existing = await fs_get("usage", doc_id)
-    if existing and int(existing.get("count", 0)) > 0:
-        await fs_set("usage", doc_id, {"count": int(existing.get("count", 0)) - 1}, merge=True)
+    if existing:
+        if kind == "image" and int(existing.get("count", 0)) > 0:
+            await fs_set("usage", doc_id, {"count": int(existing.get("count", 0)) - 1}, merge=True)
+        if kind == "video" and int(existing.get("video_count", 0)) > 0:
+            await fs_set("usage", doc_id, {"video_count": int(existing.get("video_count", 0)) - 1}, merge=True)
     await sync_usage_record(user_id)
 
 
@@ -1280,8 +1496,10 @@ class ChatSession(BaseModel):
 class EditImageBody(BaseModel):
     session_id: str
     image_id: Optional[str] = None
+    logo_image_id: Optional[str] = None
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
     provider: Literal["kie", "gemini", "openai"] = "kie"
+    output_type: Literal["image", "video"] = "image"
 
 
 class CaptionBody(BaseModel):
@@ -1303,7 +1521,7 @@ class ChatMessage(BaseModel):
     session_id: str
     user_id: str
     role: Literal["user", "assistant", "system"]
-    kind: Literal["text", "image", "caption", "suggestions", "publish"]
+    kind: Literal["text", "image", "video", "caption", "suggestions", "publish"]
     content: str = ""
     image_id: Optional[str] = None
     suggestions: Optional[List[str]] = None
@@ -1475,10 +1693,15 @@ async def update_billing_status(body: SubscriptionStatusBody, user: dict = Depen
 @api_router.get("/usage/today")
 async def usage_today(user: dict = Depends(get_current_user)):
     used = await get_usage_today(user["id"])
+    video_used = await get_video_usage_today(user["id"])
+    video_limit = PREMIUM_VIDEO_LIMIT if is_user_subscribed(user) else FREE_VIDEO_LIMIT
     return {
         "used": used,
         "limit": DAILY_PROMPT_LIMIT,
         "remaining": max(0, DAILY_PROMPT_LIMIT - used),
+        "video_used": video_used,
+        "video_limit": video_limit,
+        "video_remaining": max(0, video_limit - video_used),
         "date": today_key(),
         **entitlement_payload(user),
     }
@@ -1733,6 +1956,34 @@ async def save_image_record(user_id: str, data_b64: str, mime: str, source: str,
     return {"id": img_id, "mime": mime, "source": source, "url": f"/api/images/{img_id}"}
 
 
+async def save_video_record(
+    user_id: str,
+    source_url: str,
+    mime: str,
+    source: str,
+    meta: Optional[dict] = None,
+) -> dict:
+    video_id = str(uuid.uuid4())
+    doc = {
+        "id": video_id,
+        "user_id": user_id,
+        "mime": mime,
+        "source_url": source_url,
+        "source": source,
+        "meta": meta or {},
+        "created_at": utcnow().isoformat(),
+    }
+    await fs_set("videos", video_id, doc, merge=False)
+    await sync_video_doc(doc)
+    return {
+        "id": video_id,
+        "mime": mime,
+        "source": source,
+        "url": f"/api/videos/{video_id}",
+        "stream_url": source_url,
+    }
+
+
 @api_router.post("/images/upload")
 async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     raw = await file.read()
@@ -1755,6 +2006,17 @@ async def get_image(image_id: str):
         raise HTTPException(status_code=404, detail="Image not found")
     raw = base64.b64decode(doc["data_b64"])
     return Response(content=raw, media_type=doc.get("mime", "image/png"))
+
+
+@api_router.get("/videos/{video_id}")
+async def get_video(video_id: str):
+    doc = await fs_get("videos", video_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Video not found")
+    source_url = (doc.get("source_url") or "").strip()
+    if not source_url:
+        raise HTTPException(status_code=404, detail="Video source missing")
+    return RedirectResponse(source_url)
 
 
 # ---------- Chat Sessions ----------
@@ -1882,6 +2144,7 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
     session_id = body.session_id
     image_id = body.image_id
     prompt = body.prompt.strip()
+    output_type = body.output_type
 
     sess = await fs_get("chat_sessions", session_id)
     if sess and sess.get("user_id") != user["id"]:
@@ -1896,14 +2159,19 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
 
     async with lock:
         _enforce_rate_limit(user["id"])
-        await enforce_prompt_quota(user["id"])
         await _enforce_global_cap()
+        if output_type == "image":
+            await enforce_prompt_quota(user["id"])
+        else:
+            await enforce_video_quota(user)
 
         # User message saved early so it shows even if AI fails
         await push_message(session_id, user["id"], "user", "text", content=prompt)
 
         image_b64 = None
         img = None
+        logo_b64 = None
+        logo_mime = None
         if not image_id:
             image_id = (sess or {}).get("cover_image_id")
         if image_id:
@@ -1913,27 +2181,60 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             if not img:
                 raise HTTPException(status_code=404, detail="Image not found")
             image_b64 = img["data_b64"]
+        if body.logo_image_id:
+            logo_img = await fs_get("images", body.logo_image_id)
+            if logo_img and logo_img.get("user_id") != user["id"]:
+                logo_img = None
+            if not logo_img:
+                raise HTTPException(status_code=404, detail="Logo image not found")
+            logo_b64 = logo_img["data_b64"]
+            logo_mime = logo_img.get("mime", "image/png")
 
-        # Reserve free entitlement and quota before the expensive AI call.
-        user = await reserve_free_prompt(user)
-        await increment_usage(user["id"])
+        # Reserve quota before the expensive AI call.
+        if output_type == "image":
+            user = await reserve_free_prompt(user)
+            await increment_usage(user["id"], kind="image")
+        else:
+            await increment_usage(user["id"], kind="video")
         await _increment_global()
 
         try:
             if not image_b64:
-                raise HTTPException(status_code=400, detail="Image editing requires an uploaded source image.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="This action requires an uploaded source image.",
+                )
             source_mime = img.get("mime", "image/png") if image_id and img else "image/png"
-            new_b64, new_mime = await _generate_kie_image(prompt, image_b64, source_mime)
+            if output_type == "image":
+                new_b64, new_mime = await _generate_kie_image(
+                    prompt,
+                    image_b64,
+                    source_mime,
+                    logo_image_b64=logo_b64,
+                    logo_mime_type=logo_mime,
+                )
+                generated_video_url = None
+            else:
+                new_b64 = None
+                new_mime = None
+                generated_video_url = await _generate_kie_video(
+                    prompt,
+                    image_b64,
+                    source_mime,
+                )
         except HTTPException as e:
             # Refund on failure
-            await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
+            if output_type == "image":
+                await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"], kind=output_type)
             await _decrement_global()
-            logger.exception("KIE image edit failed")
+            logger.exception("KIE media generation failed")
             log_ai_event(
                 user_id=user["id"],
                 provider="kie",
-                model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
+                model=_resolve_kie_image_model(has_source_image=bool(image_b64))
+                if output_type == "image"
+                else _resolve_kie_video_model(),
                 prompt_length=len(prompt),
                 image_count=1 if image_b64 else 0,
                 success=False,
@@ -1941,14 +2242,17 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             )
             raise e
         except Exception as e:
-            await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
+            if output_type == "image":
+                await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"], kind=output_type)
             await _decrement_global()
-            logger.exception("KIE image edit failed")
+            logger.exception("KIE media generation failed")
             log_ai_event(
                 user_id=user["id"],
                 provider="kie",
-                model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
+                model=_resolve_kie_image_model(has_source_image=bool(image_b64))
+                if output_type == "image"
+                else _resolve_kie_video_model(),
                 prompt_length=len(prompt),
                 image_count=1 if image_b64 else 0,
                 success=False,
@@ -1956,9 +2260,9 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
             )
             raise HTTPException(status_code=502, detail=f"AI generation failed: {str(e)[:200]}")
 
-        if not new_b64:
+        if output_type == "image" and not new_b64:
             await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
+            await _decrement_user_usage(user["id"], kind="image")
             await _decrement_global()
             log_ai_event(
                 user_id=user["id"],
@@ -1970,51 +2274,100 @@ async def edit_image(body: EditImageBody, user: dict = Depends(get_current_user)
                 user=user,
             )
             raise HTTPException(status_code=502, detail="Empty image from AI")
+        if output_type == "video" and not generated_video_url:
+            await _decrement_user_usage(user["id"], kind="video")
+            await _decrement_global()
+            log_ai_event(
+                user_id=user["id"],
+                provider="kie",
+                model=_resolve_kie_video_model(),
+                prompt_length=len(prompt),
+                image_count=1 if image_b64 else 0,
+                success=False,
+                user=user,
+            )
+            raise HTTPException(status_code=502, detail="Empty video from AI")
 
         try:
-            new_rec = await save_image_record(
-                user["id"],
-                new_b64,
-                new_mime,
-                "kie",
-                meta={"prompt": prompt, "session_id": session_id},
-            )
+            if output_type == "image":
+                new_rec = await save_image_record(
+                    user["id"],
+                    new_b64,
+                    new_mime,
+                    "kie",
+                    meta={
+                        "prompt": prompt,
+                        "session_id": session_id,
+                        "logo_image_id": body.logo_image_id,
+                    },
+                )
 
-            asst_msg = await push_message(
-                session_id, user["id"], "assistant", "image",
-                content="Here's your refined image. Want to tweak it further or generate a caption?",
-                image_id=new_rec["id"],
-                suggestions=["Generate a caption for this", "Make it even more dramatic", "Try a different style"],
-                meta={"prompt": prompt},
-            )
-            await fs_set("chat_sessions", session_id, {"cover_image_id": new_rec["id"]}, merge=True)
-            session_doc = await fs_get("chat_sessions", session_id)
-            if session_doc:
-                await sync_chat_session_doc(session_doc)
+                asst_msg = await push_message(
+                    session_id, user["id"], "assistant", "image",
+                    content="Here's your refined image. Want to tweak it further or generate a caption?",
+                    image_id=new_rec["id"],
+                    suggestions=["Generate a caption for this", "Make it even more dramatic", "Try a different style"],
+                    meta={"prompt": prompt},
+                )
+                await fs_set("chat_sessions", session_id, {"cover_image_id": new_rec["id"]}, merge=True)
+                session_doc = await fs_get("chat_sessions", session_id)
+                if session_doc:
+                    await sync_chat_session_doc(session_doc)
+            else:
+                new_rec = await save_video_record(
+                    user["id"],
+                    generated_video_url,
+                    "video/mp4",
+                    "kie",
+                    meta={
+                        "prompt": prompt,
+                        "session_id": session_id,
+                        "image_id": image_id,
+                        "model": _resolve_kie_video_model(),
+                    },
+                )
+                asst_msg = await push_message(
+                    session_id,
+                    user["id"],
+                    "assistant",
+                    "video",
+                    content="Here's your generated video. Open it, download it, or try another motion direction.",
+                    suggestions=["Try a more cinematic version", "Make the motion more premium", "Generate another take"],
+                    meta={
+                        "prompt": prompt,
+                        "video_id": new_rec["id"],
+                        "video_url": new_rec["stream_url"],
+                    },
+                )
         except HTTPException:
-            await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
+            if output_type == "image":
+                await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"], kind=output_type)
             await _decrement_global()
             raise
         except Exception as exc:
-            await refund_free_prompt(user["id"])
-            await _decrement_user_usage(user["id"])
+            if output_type == "image":
+                await refund_free_prompt(user["id"])
+            await _decrement_user_usage(user["id"], kind=output_type)
             await _decrement_global()
-            logger.exception("Failed to persist generated image/chat payload")
-            raise HTTPException(status_code=502, detail=f"Generated image succeeded but could not be saved in app: {str(exc)[:220]}")
+            logger.exception("Failed to persist generated media/chat payload")
+            raise HTTPException(status_code=502, detail=f"Generated media succeeded but could not be saved in app: {str(exc)[:220]}")
 
         refreshed = await fs_get("users", user["id"]) or user
         log_ai_event(
             user_id=user["id"],
             provider="kie",
-            model=_resolve_kie_image_model(has_source_image=bool(image_b64)),
+            model=_resolve_kie_image_model(has_source_image=bool(image_b64))
+            if output_type == "image"
+            else _resolve_kie_video_model(),
             prompt_length=len(prompt),
             image_count=1 if image_b64 else 0,
             success=True,
             user=refreshed,
         )
 
-        return {"message": asst_msg, "image": new_rec, **entitlement_payload(refreshed)}
+        payload_key = "image" if output_type == "image" else "video"
+        return {"message": asst_msg, payload_key: new_rec, **entitlement_payload(refreshed)}
 
 
 # ---------- AI: Generate caption ----------
